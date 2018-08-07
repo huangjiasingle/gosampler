@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mariadb
+  namespace: mysql-operator
+spec:
+  selector:
+    matchLabels:
+      app: mariadb
+  serviceName: mariadb
+  replicas: 2
+  template:
+    metadata:
+      labels:
+        app: mariadb
+    spec:
+      containers:
+      - name: mariadb
+        image: mariadb:10.0.35
+        command:
+        - /bin/bash
+        - "-c"
+        - |
+          set -ex
+
+          [[ `hostname` =~ -([0-9]+)$ ]] || exit 1
+          ls /etc/mysql/conf.d/
+          ordinal=${BASH_REMATCH[1]}
+          echo [mysqld] > /mnt/conf.d/server-id.cnf
+          echo server-id=$((100 + $ordinal)) >> /mnt/conf.d/server-id.cnf
+          echo $ordinal
+          echo ${MYSQL_ROOT_PASSWORD}
+          echo ${CLUSTER_NAME}
+          if [[ $ordinal -eq 0 ]]; then
+            cp /mnt/config-map/master.cnf /mnt/conf.d/
+            docker-entrypoint.sh --user=root --datadir=/var/lib/mysql
+          else
+            echo "slave"
+            mysql -h${CLUSTER_NAME}-0.${CLUSTER_NAME} -uroot -p${MYSQL_ROOT_PASSWORD} <<EOF
+            CREATE USER 'replication'@'%' IDENTIFIED BY 'replication';
+            GRANT REPLICATION SLAVE ON *.* TO 'replication'@'%' IDENTIFIED BY 'replication';
+            FlUSH PRIVILEGES;
+            select sleep(10);
+          EOF
+            cp /mnt/config-map/slave.cnf /mnt/conf.d/
+
+            binlogfile=`mysql -uroot -p${MYSQL_ROOT_PASSWORD} -h ${CLUSTER_NAME}-0.${CLUSTER_NAME} -e 'show master status;' | awk 'NR>1{print $1}'`
+            pos=`mysql -uroot -p${MYSQL_ROOT_PASSWORD} -h ${CLUSTER_NAME}-0.${CLUSTER_NAME} -e 'show master status;' | awk 'NR>1{print $2}'`
+            echo ${binlogfile}
+            echo ${pos}
+            docker-entrypoint.sh --user=root --datadir=/var/lib/mysql && sleep 20 && mysql -uroot -p${MYSQL_ROOT_PASSWORD} -h127.0.0.1 <<EOF
+            stop slave;
+            CHANGE MASTER TO
+            MASTER_HOST="${CLUSTER_NAME}-0.${CLUSTER_NAME}",
+            MASTER_USER="${REPLICATION_USER}",
+            MASTER_PASSWORD="${REPLICATION_PASSWORD}",
+            MASTER_PORT=3306,
+            MASTER_LOG_FILE="${binlogfile}",
+            MASTER_LOG_POS=${pos},
+            MASTER_CONNECT_RETRY=10;
+            start slave;
+            select sleep(3);
+            show slave status;
+          EOF
+            
+            # echo "started slave mysqld"
+
+            # sleep 20
+
+          fi
+        env:
+        - name: MYSQL_ALLOW_EMPTY_PASSWORD
+          value: "1"
+        - name: MYSQL_ROOT_PASSWORD
+          value: "root"
+        - name: CLUSTER_NAME
+          value: mariadb
+        ports:
+        - name: mariadb
+          containerPort: 3306
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+          subPath: mysql
+        - name: config-map
+          mountPath: /mnt/config-map
+        - name: conf
+          mountPath: /mnt/conf.d
+        - name: conf
+          mountPath: /etc/mysql/conf.d
+        resources:
+          requests:
+            cpu: 500m
+            memory: 1Gi
+        livenessProbe:
+          exec:
+            command: ["mysqladmin", "-hlocalhost","-proot","ping"]
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          exec:
+            # Check we can execute queries over TCP (skip-networking is off).
+            command: ["mysql", "-hlocalhost","-proot","-e", "select 1;"]
+          initialDelaySeconds: 5
+          periodSeconds: 2
+          timeoutSeconds: 1
+      volumes:
+      - name: config-map
+        configMap:
+          name: mariadb
+      - name: conf
+        emptyDir: {}
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      storageClassName: standard
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 10Gi
