@@ -31,6 +31,7 @@ import (
 )
 
 func main() {
+	////
 	/*//-----------------------------------------------------------------------------
 	//创建pod
 	typeMete := unversioned.TypeMeta{Kind: "pods", APIVersion: "v1"}
