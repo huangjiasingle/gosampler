@@ -18,3 +18,4 @@ users:
   user:
     password: admin
     username: admin11232
+    a: b
